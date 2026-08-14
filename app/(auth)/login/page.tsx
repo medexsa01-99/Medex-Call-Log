@@ -1,6 +1,7 @@
 'use client'
 
 import { Suspense, useState, useEffect } from 'react'
+import Link from 'next/link'
 import { createClient } from '@/lib/supabase/client'
 import { useRouter, useSearchParams } from 'next/navigation'
 
@@ -150,6 +151,12 @@ function LoginPageInner() {
               {loading ? 'Signing in...' : 'Continue'}
             </button>
           </form>
+
+          <div className="text-center mt-4">
+            <Link href="/forgot" className="text-[12px] text-text-tertiary hover:text-indigo-400 transition-colors">
+              Forgot your password?
+            </Link>
+          </div>
         </div>
 
         <p className="text-center text-[13px] text-text-tertiary mt-5">

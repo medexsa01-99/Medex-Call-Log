@@ -57,14 +57,21 @@ export async function updateSession(request: NextRequest) {
     request.nextUrl.pathname.startsWith('/login') ||
     request.nextUrl.pathname.startsWith('/register')
 
-  // No valid user + not on auth page → redirect to login
-  if (!user && !isAuthPage) {
+  // Password-recovery pages must be reachable with OR without a session:
+  // /forgot when logged out, /reset carries a temporary recovery session.
+  const isRecoveryPage =
+    request.nextUrl.pathname.startsWith('/forgot') ||
+    request.nextUrl.pathname.startsWith('/reset')
+
+  // No valid user + not on a public page → redirect to login
+  if (!user && !isAuthPage && !isRecoveryPage) {
     const url = request.nextUrl.clone()
     url.pathname = '/login'
     return NextResponse.redirect(url)
   }
 
-  // Valid user + on auth page → redirect to dashboard
+  // Valid user + on auth page → redirect to dashboard.
+  // (Recovery pages are exempt so a recovery session can still set its password.)
   if (user && isAuthPage) {
     const url = request.nextUrl.clone()
     url.pathname = '/'
