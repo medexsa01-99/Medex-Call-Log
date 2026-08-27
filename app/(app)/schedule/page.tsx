@@ -963,7 +963,7 @@ export default function SchedulePage() {
       toast('Date, time, and type are required', 'error')
       return
     }
-    if (!formClinic && !formClinicName) {
+    if (!formClinic && !formClinicName.trim()) {
       toast('Select a clinic or enter clinic name', 'error')
       return
     }
@@ -971,7 +971,7 @@ export default function SchedulePage() {
     setFormSaving(true)
     const duration = SCHEDULE_TYPES.find(t => t.value === formType)?.duration || ''
     const clinicCode = formClinic?.clinic_code || 'MANUAL'
-    const clinicName = formClinic?.clinic_name || formClinicName
+    const clinicName = formClinic?.clinic_name || formClinicName.trim()
     const typeLabel = formType === 'Others' && formCustomType ? formCustomType : formType
 
     // 1. Create a ticket so it shows in My Log / History
@@ -2569,15 +2569,21 @@ export default function SchedulePage() {
               <div className="flex-1 overflow-y-auto p-4 space-y-4">
                 {/* Clinic */}
                 <div>
-                  <ClinicSearch onSelect={(clinic) => { setFormClinic(clinic); setFormClinicName(clinic.clinic_name) }} value={formClinic} />
+                  {/* WHY: one field, two jobs — pick an existing CRM clinic from the
+                      dropdown, or just type a name for a clinic that isn't in the CRM
+                      yet (saved with clinic_code 'MANUAL'). */}
+                  <ClinicSearch
+                    allowFreeText
+                    onSelect={(clinic) => { setFormClinic(clinic); setFormClinicName(clinic.clinic_name) }}
+                    onFreeText={(text) => { setFormClinic(null); setFormClinicName(text) }}
+                    value={formClinic}
+                    freeTextValue={formClinicName}
+                  />
                   {formClinic && (
                     <p className="text-xs text-text-tertiary mt-1">{formClinic.clinic_code} — {formClinic.clinic_name}</p>
                   )}
-                  {!formClinic && formClinicName && (
-                    <div className="flex items-center justify-between mt-1 px-1">
-                      <p className="text-xs text-text-secondary">{formClinicName}</p>
-                      <button type="button" onClick={() => setFormClinicName('')} className="text-xs text-text-tertiary hover:text-text-primary">Clear</button>
-                    </div>
+                  {!formClinic && formClinicName.trim() && (
+                    <p className="text-xs text-amber-400/80 mt-1">Not in CRM — will be saved as typed</p>
                   )}
                 </div>
 

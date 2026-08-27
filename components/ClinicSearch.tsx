@@ -17,6 +17,13 @@ interface ClinicSearchProps {
   onOpenTickets?: (tickets: OpenTicketWarning[]) => void
   value?: Clinic | null  // controlled mode — parent can set the selected clinic
   hideLabel?: boolean
+  // WHY: some forms (e.g. Add Schedule) book clinics that aren't in the CRM yet.
+  // With allowFreeText the one input does both jobs — it still fuzzy-searches the
+  // CRM and shows the dropdown, but whatever is typed is also reported via
+  // onFreeText so the parent can save it as-is when nothing is picked.
+  allowFreeText?: boolean
+  onFreeText?: (text: string) => void
+  freeTextValue?: string  // parent-held typed text, so a clinic→null value change doesn't wipe the input
 }
 
 // WHY: The clinic list (~3,900 rows, ~1-2 MB) barely changes but was re-downloaded
@@ -78,7 +85,7 @@ export function invalidateClinicCache() {
   clinicCachePromise = null
 }
 
-export default function ClinicSearch({ onSelect, onOpenTickets, value, hideLabel }: ClinicSearchProps) {
+export default function ClinicSearch({ onSelect, onOpenTickets, value, hideLabel, allowFreeText, onFreeText, freeTextValue }: ClinicSearchProps) {
   const [query, setQuery] = useState('')
   const [clinics, setClinics] = useState<Clinic[]>([])
   const [results, setResults] = useState<Clinic[]>([])
@@ -97,8 +104,12 @@ export default function ClinicSearch({ onSelect, onOpenTickets, value, hideLabel
       setQuery(`[${value.clinic_code}] ${value.clinic_name}`)
     } else {
       setSelectedClinic(null)
-      setQuery('')
+      // WHY: in free-text mode, typing over a selected clinic makes the parent drop
+      // its Clinic to null, which re-fires this effect. Falling back to freeTextValue
+      // keeps the characters just typed instead of blanking the input mid-keystroke.
+      setQuery(allowFreeText ? (freeTextValue ?? '') : '')
     }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [value])
 
   // Load clinics on mount — served from the module cache after the first load
@@ -207,6 +218,9 @@ export default function ClinicSearch({ onSelect, onOpenTickets, value, hideLabel
     }
   }
 
+  // Clear (×) shows for a picked clinic, and in free-text mode for any typed text.
+  const showClear = !!selectedClinic || (!!allowFreeText && query.length > 0)
+
   const handleSelect = (clinic: Clinic) => {
     setSelectedClinic(clinic)
     setQuery(`[${clinic.clinic_code}] ${clinic.clinic_name}`)
@@ -219,7 +233,9 @@ export default function ClinicSearch({ onSelect, onOpenTickets, value, hideLabel
     setSelectedClinic(null)
     setQuery('')
     setResults([])
+    setShowDropdown(false)
     onOpenTickets?.([])
+    if (allowFreeText) onFreeText?.('')
     inputRef.current?.focus()
   }
 
@@ -238,14 +254,17 @@ export default function ClinicSearch({ onSelect, onOpenTickets, value, hideLabel
           onChange={(e) => {
             setQuery(e.target.value)
             if (selectedClinic) setSelectedClinic(null)
+            if (allowFreeText) onFreeText?.(e.target.value)
           }}
-          placeholder={loading ? 'Loading clinics...' : 'Search clinic name or code...'}
+          placeholder={loading
+            ? 'Loading clinics...'
+            : allowFreeText ? 'Search clinic, or type a name...' : 'Search clinic name or code...'}
           disabled={loading}
-          className="w-full px-3 py-2.5 bg-surface border border-border rounded-lg text-white
+          className={`w-full pl-3 py-2.5 bg-surface border border-border rounded-lg text-white
                      placeholder:text-text-tertiary focus:outline-none focus:ring-2 focus:ring-blue-500/50
-                     focus:border-blue-500/50 font-mono text-sm"
+                     focus:border-blue-500/50 font-mono text-sm ${showClear ? 'pr-10' : 'pr-3'}`}
         />
-        {selectedClinic && (
+        {showClear && (
           <button
             type="button"
             onClick={handleClear}
@@ -307,7 +326,11 @@ export default function ClinicSearch({ onSelect, onOpenTickets, value, hideLabel
       {/* No results */}
       {showDropdown && query.length >= 2 && results.length === 0 && (
         <div className="absolute z-40 w-full mt-1 bg-surface border border-border rounded-lg p-3">
-          <p className="text-sm text-text-tertiary">No clinic found. You can fill details manually.</p>
+          <p className="text-sm text-text-tertiary">
+            {allowFreeText
+              ? <>No CRM match — <span className="text-text-secondary">&ldquo;{query}&rdquo;</span> will be saved as typed.</>
+              : 'No clinic found. You can fill details manually.'}
+          </p>
         </div>
       )}
     </div>
