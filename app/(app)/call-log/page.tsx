@@ -459,8 +459,17 @@ export default function CallLogPage() {
 
   // ── Row click ──────────────────────────────────────────────────
   const handleRowClick = (e: CallEntry) => {
-    if (e.source === 'submitted') window.open(`/tickets/${e.id}`, '_blank')
+    if (e.source !== 'submitted') return
+    // A blocked popup returns null instead of throwing — fall back to in-place nav
+    // so the row never looks dead for users whose browser blocks window.open().
+    if (!window.open(`/tickets/${e.id}`, '_blank')) window.location.href = `/tickets/${e.id}`
   }
+
+  // WHY: rendered as a real anchor, not window.open(). Popup blockers swallow
+  // window.open() in some browsers/profiles with no error at all, which made the
+  // Log Call button look dead for that one user.
+  const logCallHref = (e: CallEntry) =>
+    `/log?phone=${encodeURIComponent(e.phone)}${e.clinic !== '-' ? `&clinic=${encodeURIComponent(e.clinic)}` : ''}&missed_id=${e.id}`
 
   // ── Date nav ───────────────────────────────────────────────────
   const goToday = () => setSelectedDate(format(new Date(), 'yyyy-MM-dd'))
@@ -1014,9 +1023,9 @@ export default function CallLogPage() {
                               </span>
                             </div>
                             <div className="flex items-center gap-1.5">
-                              <button onClick={ev => { ev.stopPropagation(); window.open(`/log?phone=${encodeURIComponent(e.phone)}${e.clinic !== '-' ? `&clinic=${encodeURIComponent(e.clinic)}` : ''}&missed_id=${e.id}`, '_blank') }} className="text-xs font-medium px-2 py-1 rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 transition-colors whitespace-nowrap">
+                              <a href={logCallHref(e)} target="_blank" rel="noopener noreferrer" onClick={ev => ev.stopPropagation()} className="inline-flex items-center text-xs font-medium px-2 py-1 rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 transition-colors whitespace-nowrap">
                                 Log Call
-                              </button>
+                              </a>
                               <button onClick={ev => { ev.stopPropagation(); handleReopen(e) }} className="text-xs text-text-tertiary hover:text-text-primary transition-colors">
                                 Undo
                               </button>
@@ -1024,9 +1033,9 @@ export default function CallLogPage() {
                           </div>
                         ) : (
                           <div className="flex items-center gap-1.5 flex-wrap">
-                            <button onClick={ev => { ev.stopPropagation(); window.open(`/log?phone=${encodeURIComponent(e.phone)}${e.clinic !== '-' ? `&clinic=${encodeURIComponent(e.clinic)}` : ''}&missed_id=${e.id}`, '_blank') }} className="text-xs font-medium px-2 py-1 rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 transition-colors whitespace-nowrap">
+                            <a href={logCallHref(e)} target="_blank" rel="noopener noreferrer" onClick={ev => ev.stopPropagation()} className="inline-flex items-center text-xs font-medium px-2 py-1 rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 transition-colors whitespace-nowrap">
                               Log Call
-                            </button>
+                            </a>
                             <button onClick={ev => { ev.stopPropagation(); handleResolve(e, 'no_answer') }} className="text-xs font-medium px-2 py-1 rounded-lg bg-amber-600 text-white hover:bg-amber-700 transition-colors whitespace-nowrap">
                               No Answer
                             </button>
@@ -1111,13 +1120,13 @@ export default function CallLogPage() {
                         </span>
                       </div>
                       <div className="flex items-center gap-1.5">
-                        <button onClick={ev => { ev.stopPropagation(); window.open(`/log?phone=${encodeURIComponent(e.phone)}${e.clinic !== '-' ? `&clinic=${encodeURIComponent(e.clinic)}` : ''}&missed_id=${e.id}`, '_blank') }} className="text-xs font-medium px-2 py-1 rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 transition-colors">Log Call</button>
+                        <a href={logCallHref(e)} target="_blank" rel="noopener noreferrer" onClick={ev => ev.stopPropagation()} className="inline-flex items-center text-xs font-medium px-2 py-1 rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 transition-colors">Log Call</a>
                         <button onClick={ev => { ev.stopPropagation(); handleReopen(e) }} className="text-xs text-text-tertiary hover:text-text-primary transition-colors">Undo</button>
                       </div>
                     </div>
                   ) : (
                     <div className="mt-1.5 flex items-center gap-1.5">
-                      <button onClick={ev => { ev.stopPropagation(); window.open(`/log?phone=${encodeURIComponent(e.phone)}${e.clinic !== '-' ? `&clinic=${encodeURIComponent(e.clinic)}` : ''}&missed_id=${e.id}`, '_blank') }} className="text-xs font-medium px-2 py-1 rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 transition-colors">Log Call</button>
+                      <a href={logCallHref(e)} target="_blank" rel="noopener noreferrer" onClick={ev => ev.stopPropagation()} className="inline-flex items-center text-xs font-medium px-2 py-1 rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 transition-colors">Log Call</a>
                       <button onClick={ev => { ev.stopPropagation(); handleResolve(e, 'no_answer') }} className="text-xs font-medium px-2 py-1 rounded-lg bg-amber-600 text-white hover:bg-amber-700 transition-colors">No Answer</button>
                       <button onClick={ev => { ev.stopPropagation(); setDismissEntry(e); setDismissNote('') }} className="text-xs font-medium px-2 py-1 rounded-lg bg-zinc-600 text-white hover:bg-zinc-700 transition-colors">Dismiss</button>
                     </div>
