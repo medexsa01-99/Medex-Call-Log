@@ -7,7 +7,7 @@ import {
   eachDayOfInterval, getDay, addDays, startOfISOWeek,
   getISOWeek,
 } from 'date-fns'
-import type { SaturdayShift, StandbyShift, ReplacementLeave, StaffRef, PublicHoliday, Profile, ShiftLog, StandbyOverride } from '@/lib/types'
+import type { SaturdayShift, StandbyShift, ReplacementLeave, StaffLeave, StaffRef, PublicHoliday, Profile, ShiftLog, StandbyOverride } from '@/lib/types'
 import { formatDistanceToNow } from 'date-fns'
 import { toProperCase } from '@/lib/constants'
 import { ModalDialog } from '@/components/Modal'
@@ -21,7 +21,68 @@ import { useSearchParams } from 'next/navigation'
 type Section = 'schedules' | 'ot'
 type Tab = 'saturday' | 'standby' | 'leave'
 
+type StaffLeaveRow = StaffLeave & {
+  profiles: { display_name: string } | { display_name: string }[] | null
+}
+
+// One applied replacement-leave day, whichever path recorded it:
+// shift page modal (replacement_leaves) or calendar Mark Leave → Replacement
+// (staff_leave). Both must reduce the balance.
+type RlEntry = {
+  id: string
+  staff_id: string
+  staff_name: string
+  leave_date: string
+  duration: number
+  notes: string | null
+  source: 'shift' | 'calendar'
+}
+
 const HOLIDAY_SCOPES = ['federal', 'SEL', 'KUL']
+
+// Holidays that earn no standby hours: Malaysian federal holidays + Selangor
+// state holidays (incl. the replacement holidays admin records for a holiday
+// that falls on a weekend).
+const RL_HOLIDAY_SCOPES = ['federal', 'SEL']
+
+// Replacement-leave applications can be typed in a few ways once they arrive
+// through the calendar (staff app / admin entry): 'Replacement', 'RL', 'Cuti Ganti'.
+const RL_REASON_RE = /replacement|cuti\s*ganti|\brl\b/i
+
+// Weekday standby = 2h/day (Mon–Fri), Sunday standby = 9am–6pm = 9h,
+// 1 day of replacement leave = 8h deduction (half day = 4h).
+const WEEKDAY_HRS = 2
+const SUN_HRS = 9
+const RL_DAY_HRS = 8
+
+// WHY: a public/state/replacement holiday inside a standby week is already a day
+// off, so it earns no standby hours. (Applied leave is still deducted in full —
+// the holiday only affects the earning side.)
+// Splits a Mon–Sun standby week into billable days, skipping holiday dates.
+function standbyWeekDays(s: StandbyShift, holidayDates: Set<string>) {
+  const days = eachDayOfInterval({
+    start: new Date(s.week_start + 'T00:00:00'),
+    end: new Date(s.week_end + 'T00:00:00'),
+  })
+  const weekdayWorked: string[] = []
+  const weekdayHolidays: string[] = []
+  days.forEach(d => {
+    const dow = getDay(d)
+    if (dow < 1 || dow > 5) return
+    const key = format(d, 'yyyy-MM-dd')
+    if (holidayDates.has(key)) weekdayHolidays.push(key)
+    else weekdayWorked.push(key)
+  })
+  const sunday = days.find(d => getDay(d) === 0)
+  const sundayDate = sunday ? format(sunday, 'yyyy-MM-dd') : s.week_end
+  return {
+    weekdayWorked,
+    weekdayHolidays,
+    weekdayHrs: weekdayWorked.length * WEEKDAY_HRS,
+    sundayDate,
+    sundayWorked: !holidayDates.has(sundayDate),
+  }
+}
 
 export default function ShiftPage() {
   const supabase = createClient()
@@ -44,6 +105,7 @@ export default function ShiftPage() {
   const [saturdayShifts, setSaturdayShifts] = useState<SaturdayShift[]>([])
   const [standbyShifts, setStandbyShifts] = useState<StandbyShift[]>([])
   const [leaves, setLeaves] = useState<ReplacementLeave[]>([])
+  const [staffLeaveRows, setStaffLeaveRows] = useState<StaffLeaveRow[]>([])
   const [holidays, setHolidays] = useState<PublicHoliday[]>([])
 
   const [showModal, setShowModal] = useState(false)
@@ -108,11 +170,18 @@ export default function ShiftPage() {
   }, [supabase])
 
   const loadLeaves = useCallback(async () => {
-    const { data } = await supabase
-      .from('replacement_leaves')
-      .select('*')
-      .order('leave_date', { ascending: false })
-    if (data) setLeaves(data as ReplacementLeave[])
+    const [rlRes, slRes] = await Promise.all([
+      supabase
+        .from('replacement_leaves')
+        .select('*')
+        .order('leave_date', { ascending: false }),
+      supabase
+        .from('staff_leave')
+        .select('*, profiles!staff_leave_staff_id_fkey(display_name)')
+        .order('leave_date', { ascending: false }),
+    ])
+    if (rlRes.data) setLeaves(rlRes.data as ReplacementLeave[])
+    if (slRes.data) setStaffLeaveRows(slRes.data as StaffLeaveRow[])
   }, [supabase])
 
   useEffect(() => {
@@ -153,6 +222,13 @@ export default function ShiftPage() {
     if (!loading) loadMonthData(currentMonth)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentMonth])
+
+  // Re-pull applications whenever the RL tab is opened so leave staff applied
+  // (from this page or the calendar) is always deducted straight away.
+  useEffect(() => {
+    if (tab === 'leave' && !loading) loadLeaves()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab])
 
   // ── Computed ───────────────────────────────────────────────────────────
 
@@ -195,8 +271,52 @@ export default function ShiftPage() {
     return map
   }, [standbyShifts])
 
-  const filteredLeaves = useMemo(() => {
-    let list = leaves
+  // ── Hours summary (Weekday 2h/day, Sun 9am-6pm=9h) ──
+  // Saturday (9am-1pm=4h) is OT claim, not replacement leave
+  // 1 day RL = 8h deduction, 0.5 day = 4h
+  const rlHolidayDates = useMemo(() => {
+    const set = new Set<string>()
+    holidays.forEach(h => { if (RL_HOLIDAY_SCOPES.includes(h.scope)) set.add(h.holiday_date) })
+    return set
+  }, [holidays])
+
+  // Every applied replacement-leave day, from both entry points. A staff member
+  // who applied leave is always listed, even before any standby week completes.
+  const rlApplications = useMemo<RlEntry[]>(() => {
+    const list: RlEntry[] = leaves.map(l => ({
+      id: l.id,
+      staff_id: l.staff_id,
+      staff_name: l.staff_name,
+      leave_date: l.leave_date,
+      duration: l.duration,
+      notes: l.notes,
+      source: 'shift',
+    }))
+    const seen = new Set(list.map(e => `${e.staff_id}|${e.leave_date}`))
+    const nameOf = (r: StaffLeaveRow) => {
+      const joined = Array.isArray(r.profiles) ? r.profiles[0]?.display_name : r.profiles?.display_name
+      return joined || agents.find(a => a.id === r.staff_id)?.display_name || 'Staff'
+    }
+    staffLeaveRows.forEach(r => {
+      if (!r.reason || !RL_REASON_RE.test(r.reason)) return
+      const key = `${r.staff_id}|${r.leave_date}`
+      if (seen.has(key)) return
+      seen.add(key)
+      list.push({
+        id: r.id,
+        staff_id: r.staff_id,
+        staff_name: nameOf(r),
+        leave_date: r.leave_date,
+        duration: /half/i.test(r.reason) ? 0.5 : 1,
+        notes: r.reason,
+        source: 'calendar',
+      })
+    })
+    return list.sort((a, b) => b.leave_date.localeCompare(a.leave_date))
+  }, [leaves, staffLeaveRows, agents])
+
+  const filteredApplications = useMemo(() => {
+    let list = rlApplications
     if (leaveFilterStaff !== 'all') {
       list = list.filter(l => l.staff_id === leaveFilterStaff)
     }
@@ -204,59 +324,92 @@ export default function ShiftPage() {
       list = list.filter(l => l.leave_date.startsWith(leaveFilterMonth))
     }
     return list
-  }, [leaves, leaveFilterStaff, leaveFilterMonth])
+  }, [rlApplications, leaveFilterStaff, leaveFilterMonth])
 
   const leaveMonthOptions = useMemo(() => {
     const months = new Set<string>()
-    leaves.forEach(l => months.add(l.leave_date.slice(0, 7)))
+    rlApplications.forEach(l => months.add(l.leave_date.slice(0, 7)))
     return Array.from(months).sort().reverse()
-  }, [leaves])
-
-  // ── Hours summary (Weekday 2h×5=10h/wk, Sun 9am-6pm=9h) ──
-  // Saturday (9am-1pm=4h) is OT claim, not replacement leave
-  // 1 day RL = 8h deduction, 0.5 day = 4h
-  const WEEKDAY_HRS = 10
-  const SUN_HRS = 9
-  const RL_DAY_HRS = 8
+  }, [rlApplications])
 
   const hoursSummary = useMemo(() => {
     const today = format(new Date(), 'yyyy-MM-dd')
-    const map: Record<string, { name: string; weekdayWeeks: number; sunWeeks: number }> = {}
+    type Row = {
+      name: string
+      weekdayDays: number
+      weekdayHrs: number
+      sunDays: number
+      sunHrs: number
+      holidayWeekdays: string[]
+      holidaySundays: string[]
+    }
+    const map: Record<string, Row> = {}
     const ensure = (id: string, name: string) => {
-      if (!map[id]) map[id] = { name, weekdayWeeks: 0, sunWeeks: 0 }
+      if (!map[id]) {
+        map[id] = { name, weekdayDays: 0, weekdayHrs: 0, sunDays: 0, sunHrs: 0, holidayWeekdays: [], holidaySundays: [] }
+      }
+      return map[id]
+    }
+    const addHolidays = (list: string[], dates: string[]) => {
+      dates.forEach(d => { if (!list.includes(d)) list.push(d) })
     }
 
     allStandby.forEach(s => {
       if (s.week_end > today) return
-      ;(s.weekday_staff || []).forEach(r => { ensure(r.id, r.name); map[r.id].weekdayWeeks++ })
-      ;(s.weekend_staff || []).forEach(r => { ensure(r.id, r.name); map[r.id].sunWeeks++ })
+      const w = standbyWeekDays(s, rlHolidayDates)
+      ;(s.weekday_staff || []).forEach(r => {
+        const row = ensure(r.id, r.name)
+        row.weekdayDays += w.weekdayWorked.length
+        row.weekdayHrs += w.weekdayHrs
+        addHolidays(row.holidayWeekdays, w.weekdayHolidays)
+      })
+      ;(s.weekend_staff || []).forEach(r => {
+        const row = ensure(r.id, r.name)
+        if (w.sundayWorked) {
+          row.sunDays += 1
+          row.sunHrs += SUN_HRS
+        } else {
+          addHolidays(row.holidaySundays, [w.sundayDate])
+        }
+      })
     })
 
-    // Swap adjustments: original loses hours, replacement gains hours
+    // Swap adjustments: original loses hours, replacement gains hours.
+    // A swap dated on a holiday moves nothing — that day is not worked.
     const swapAdj: Record<string, number> = {}
     overrides.forEach(o => {
       if (o.override_date > today) return
+      if (rlHolidayDates.has(o.override_date)) return
       swapAdj[o.original_staff_id] = (swapAdj[o.original_staff_id] || 0) - o.hours
       swapAdj[o.replacement_staff_id] = (swapAdj[o.replacement_staff_id] || 0) + o.hours
       ensure(o.replacement_staff_id, o.replacement_staff_name)
     })
 
+    // Every applied day is deducted — a holiday only stops standby hours being
+    // earned, it never hides a leave the staff member already applied for.
     const rlByStaff: Record<string, number> = {}
-    leaves.forEach(l => { rlByStaff[l.staff_id] = (rlByStaff[l.staff_id] || 0) + l.duration })
+    rlApplications.forEach(a => {
+      ensure(a.staff_id, a.staff_name)
+      rlByStaff[a.staff_id] = (rlByStaff[a.staff_id] || 0) + a.duration
+    })
 
     return Object.entries(map)
       .map(([id, h]) => {
         const swapHrs = swapAdj[id] || 0
-        const earnedHrs = h.weekdayWeeks * WEEKDAY_HRS + h.sunWeeks * SUN_HRS + swapHrs
+        const earnedHrs = h.weekdayHrs + h.sunHrs + swapHrs
         const rlDays = rlByStaff[id] || 0
         const usedHrs = rlDays * RL_DAY_HRS
         return {
           id,
           name: h.name,
-          weekdayWeeks: h.weekdayWeeks,
-          weekdayHrs: h.weekdayWeeks * WEEKDAY_HRS,
-          sunWeeks: h.sunWeeks,
-          sunHrs: h.sunWeeks * SUN_HRS,
+          weekdayDays: h.weekdayDays,
+          weekdayHrs: h.weekdayHrs,
+          sunDays: h.sunDays,
+          sunHrs: h.sunHrs,
+          holidayWeekdays: h.holidayWeekdays,
+          holidaySundays: h.holidaySundays,
+          holidayExcludedDays: h.holidayWeekdays.length + h.holidaySundays.length,
+          holidayExcludedHrs: h.holidayWeekdays.length * WEEKDAY_HRS + h.holidaySundays.length * SUN_HRS,
           swapHrs,
           earnedHrs,
           rlDays,
@@ -265,28 +418,32 @@ export default function ShiftPage() {
         }
       })
       .sort((a, b) => b.balanceHrs - a.balanceHrs)
-  }, [allStandby, leaves, overrides])
+  }, [allStandby, rlApplications, overrides, rlHolidayDates])
 
   const hoursDetail = useMemo(() => {
     if (!hoursDetailFor) return null
     const today = format(new Date(), 'yyyy-MM-dd')
-    const weekdays: { from: string; to: string }[] = []
-    const sundays: { from: string; to: string }[] = []
+    const weekdays: { from: string; to: string; days: number; hrs: number; holidays: string[] }[] = []
+    const sundays: { date: string; worked: boolean }[] = []
 
     allStandby.forEach(s => {
       if (s.week_end > today) return
+      const w = standbyWeekDays(s, rlHolidayDates)
       if ((s.weekday_staff || []).some(r => r.id === hoursDetailFor)) {
-        weekdays.push({ from: s.week_start, to: s.week_end })
+        weekdays.push({ from: s.week_start, to: s.week_end, days: w.weekdayWorked.length, hrs: w.weekdayHrs, holidays: w.weekdayHolidays })
       }
       if ((s.weekend_staff || []).some(r => r.id === hoursDetailFor)) {
-        sundays.push({ from: s.week_start, to: s.week_end })
+        sundays.push({ date: w.sundayDate, worked: w.sundayWorked })
       }
     })
 
     weekdays.sort((a, b) => a.from.localeCompare(b.from))
-    sundays.sort((a, b) => a.from.localeCompare(b.from))
+    sundays.sort((a, b) => a.date.localeCompare(b.date))
 
-    const rlEntries = leaves.filter(l => l.staff_id === hoursDetailFor).sort((a, b) => a.leave_date.localeCompare(b.leave_date))
+    const rlEntries = rlApplications
+      .filter(l => l.staff_id === hoursDetailFor)
+      .map(l => ({ ...l, onHoliday: rlHolidayDates.has(l.leave_date) }))
+      .sort((a, b) => a.leave_date.localeCompare(b.leave_date))
 
     const swapEntries = overrides
       .filter(o => o.override_date <= today && (o.original_staff_id === hoursDetailFor || o.replacement_staff_id === hoursDetailFor))
@@ -295,13 +452,14 @@ export default function ShiftPage() {
         hours: o.original_staff_id === hoursDetailFor ? -o.hours : o.hours,
         otherName: o.original_staff_id === hoursDetailFor ? o.replacement_staff_name : o.original_staff_name,
         reason: o.reason,
+        skipped: rlHolidayDates.has(o.override_date),
       }))
       .sort((a, b) => a.date.localeCompare(b.date))
 
     const summary = hoursSummary.find(h => h.id === hoursDetailFor)
 
     return { weekdays, sundays, rlEntries, swapEntries, summary }
-  }, [hoursDetailFor, allStandby, leaves, overrides, hoursSummary])
+  }, [hoursDetailFor, allStandby, rlApplications, overrides, hoursSummary, rlHolidayDates])
 
   // ── Modal helpers ──────────────────────────────────────────────────────
 
@@ -497,15 +655,18 @@ export default function ShiftPage() {
     setSaving(false)
   }
 
-  const deleteLeave = async (id: string) => {
+  const deleteApplication = async (entry: RlEntry) => {
     if (!confirm('Delete this replacement leave?')) return
-    const lv = leaves.find(l => l.id === id)
-    const { error } = await supabase.from('replacement_leaves').delete().eq('id', id)
-    if (!error) {
-      if (lv) await logChange('delete', 'leave', `${toProperCase(lv.staff_name)} — ${format(new Date(lv.leave_date + 'T00:00:00'), 'dd/MM/yyyy')}`)
-      setLeaves(prev => prev.filter(l => l.id !== id))
-      toast('Deleted')
+    // Applications can live in either table depending on where staff applied
+    const table = entry.source === 'shift' ? 'replacement_leaves' : 'staff_leave'
+    const { error } = await supabase.from(table).delete().eq('id', entry.id)
+    if (error) {
+      toast('Failed to delete', 'error')
+      return
     }
+    await logChange('delete', 'leave', `${toProperCase(entry.staff_name)} — ${format(new Date(entry.leave_date + 'T00:00:00'), 'dd/MM/yyyy')}`)
+    await loadLeaves()
+    toast('Deleted')
   }
 
   // ── CRUD: Standby Swap ──────────────────────────────────────────────────
@@ -898,13 +1059,27 @@ export default function ShiftPage() {
                   </div>
                   <div className="space-y-1.5 text-xs">
                     <div className="flex items-center justify-between">
-                      <span className="text-text-tertiary">Weekday <span className="text-text-muted">(2h×5/wk)</span></span>
-                      <span className="text-text-secondary font-medium tabular-nums">{h.weekdayWeeks} wk = <span className="text-indigo-400">{h.weekdayHrs}h</span></span>
+                      <span className="text-text-tertiary">Weekday <span className="text-text-muted">(2h/day)</span></span>
+                      <span className="text-text-secondary font-medium tabular-nums">{h.weekdayDays} day{h.weekdayDays === 1 ? '' : 's'} = <span className="text-indigo-400">{h.weekdayHrs}h</span></span>
                     </div>
                     <div className="flex items-center justify-between">
                       <span className="text-text-tertiary">Sunday <span className="text-text-muted">(9h each)</span></span>
-                      <span className="text-text-secondary font-medium tabular-nums">{h.sunWeeks}× = <span className="text-amber-400">{h.sunHrs}h</span></span>
+                      <span className="text-text-secondary font-medium tabular-nums">{h.sunDays}× = <span className="text-amber-400">{h.sunHrs}h</span></span>
                     </div>
+                    {h.holidayExcludedDays > 0 && (
+                      <div className="flex items-center justify-between">
+                        <span className="text-text-tertiary">Holiday <span className="text-text-muted">(excluded)</span></span>
+                        <span
+                          className="text-text-muted font-medium tabular-nums cursor-help"
+                          title={[...h.holidayWeekdays, ...h.holidaySundays]
+                            .map(d => `${format(new Date(d + 'T00:00:00'), 'dd/MM')} ${(holidayMap.get(d) || ['Holiday'])[0]}`)
+                            .join('\n')}
+                        >
+                          {h.holidayExcludedDays} day{h.holidayExcludedDays === 1 ? '' : 's'}
+                          <span className="text-text-muted/60 font-normal"> · {h.holidayExcludedHrs}h</span>
+                        </span>
+                      </div>
+                    )}
                     {h.swapHrs !== 0 && (
                       <div className="flex items-center justify-between">
                         <span className="text-text-tertiary">Swap</span>
@@ -957,7 +1132,7 @@ export default function ShiftPage() {
             <Button size="sm" onClick={openAddModal}>+ Add Leave</Button>
           </div>
 
-          {filteredLeaves.length === 0 ? (
+          {filteredApplications.length === 0 ? (
             <EmptyState
               icon={<svg className="size-8 text-text-muted" fill="none" stroke="currentColor" strokeWidth={1.2} viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M6.75 3v2.25M17.25 3v2.25M3 18.75V7.5a2.25 2.25 0 012.25-2.25h13.5A2.25 2.25 0 0121 7.5v11.25m-18 0A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75" /></svg>}
               title="No replacement leave entries"
@@ -975,10 +1150,15 @@ export default function ShiftPage() {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-border">
-                  {filteredLeaves.map(lv => (
-                    <tr key={lv.id} className="hover:bg-surface-raised/50 transition-colors">
+                  {filteredApplications.map(lv => (
+                    <tr key={`${lv.source}-${lv.id}`} className="hover:bg-surface-raised/50 transition-colors">
                       <td className="px-4 py-3">
                         <span className="text-text-primary font-medium">{toProperCase(lv.staff_name)}</span>
+                        {lv.source === 'calendar' && (
+                          <span className="ml-1.5 inline-block px-1.5 py-0.5 text-[10px] font-medium rounded bg-teal-500/15 text-teal-400" title="Applied via Calendar → Mark Leave">
+                            Calendar
+                          </span>
+                        )}
                       </td>
                       <td className="px-4 py-3">
                         <span className="text-text-primary">{format(new Date(lv.leave_date + 'T00:00:00'), 'dd/MM/yyyy')}</span>
@@ -997,10 +1177,20 @@ export default function ShiftPage() {
                       </td>
                       <td className="px-4 py-3 text-right">
                         <div className="flex items-center justify-end gap-1">
-                          <button onClick={() => openEditModal(lv)} className="p-1.5 rounded hover:bg-surface-raised text-text-tertiary hover:text-indigo-400 transition-colors">
-                            <svg className="size-3.5" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M16.862 4.487l1.687-1.688a1.875 1.875 0 112.652 2.652L10.582 16.07a4.5 4.5 0 01-1.897 1.13L6 18l.8-2.685a4.5 4.5 0 011.13-1.897l8.932-8.931z" /></svg>
-                          </button>
-                          <button onClick={() => deleteLeave(lv.id)} className="p-1.5 rounded hover:bg-red-500/10 text-text-tertiary hover:text-red-400 transition-colors">
+                          {lv.source === 'shift' ? (
+                            <button
+                              onClick={() => {
+                                const row = leaves.find(l => l.id === lv.id)
+                                if (row) openEditModal(row)
+                              }}
+                              className="p-1.5 rounded hover:bg-surface-raised text-text-tertiary hover:text-indigo-400 transition-colors"
+                            >
+                              <svg className="size-3.5" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M16.862 4.487l1.687-1.688a1.875 1.875 0 112.652 2.652L10.582 16.07a4.5 4.5 0 01-1.897 1.13L6 18l.8-2.685a4.5 4.5 0 011.13-1.897l8.932-8.931z" /></svg>
+                            </button>
+                          ) : (
+                            <span className="text-[10px] text-text-muted px-1" title="Edit this entry from the Calendar">—</span>
+                          )}
+                          <button onClick={() => deleteApplication(lv)} className="p-1.5 rounded hover:bg-red-500/10 text-text-tertiary hover:text-red-400 transition-colors">
                             <svg className="size-3.5" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
                           </button>
                         </div>
@@ -1210,6 +1400,12 @@ export default function ShiftPage() {
                   value={formDate}
                   onChange={e => setFormDate(e.target.value)}
                 />
+                {formDate && rlHolidayDates.has(formDate) && (
+                  <p className="text-[11px] text-amber-400 mt-1">
+                    {(holidayMap.get(formDate) || ['Public holiday']).join(', ')} — public/state holiday.
+                    Leave recorded here is still deducted from the balance.
+                  </p>
+                )}
               </div>
               <div>
                 <Label required>Duration</Label>
@@ -1269,14 +1465,21 @@ export default function ShiftPage() {
             <div>
               <div className="flex items-center justify-between mb-2">
                 <span className="text-xs font-semibold text-indigo-400 uppercase tracking-wider">Weekday Standby</span>
-                <span className="text-xs font-bold text-text-primary tabular-nums">{hoursDetail.summary?.weekdayHrs || 0}h <span className="text-text-muted font-normal">({hoursDetail.weekdays.length} wk × 10h)</span></span>
+                <span className="text-xs font-bold text-text-primary tabular-nums">{hoursDetail.summary?.weekdayHrs || 0}h <span className="text-text-muted font-normal">({hoursDetail.summary?.weekdayDays || 0} days × 2h)</span></span>
               </div>
               {hoursDetail.weekdays.length > 0 ? (
                 <div className="space-y-0.5">
                   {hoursDetail.weekdays.map((w, i) => (
                     <div key={i} className="flex items-center justify-between py-1 px-2.5 rounded hover:bg-surface-raised/50 text-xs">
-                      <span className="text-text-secondary">{format(new Date(w.from + 'T00:00:00'), 'dd/MM/yyyy')} – {format(new Date(w.to + 'T00:00:00'), 'dd/MM/yyyy')}</span>
-                      <span className="text-indigo-400 font-medium tabular-nums">10h</span>
+                      <span className="text-text-secondary">
+                        {format(new Date(w.from + 'T00:00:00'), 'dd/MM/yyyy')} – {format(new Date(w.to + 'T00:00:00'), 'dd/MM/yyyy')}
+                        {w.holidays.length > 0 && (
+                          <span className="text-amber-400/80 ml-1.5">
+                            {w.holidays.map(d => (holidayMap.get(d) || ['Holiday'])[0]).join(', ')} skipped
+                          </span>
+                        )}
+                      </span>
+                      <span className="text-indigo-400 font-medium tabular-nums">{w.hrs}h</span>
                     </div>
                   ))}
                 </div>
@@ -1289,14 +1492,17 @@ export default function ShiftPage() {
             <div>
               <div className="flex items-center justify-between mb-2">
                 <span className="text-xs font-semibold text-amber-400 uppercase tracking-wider">Sunday Standby</span>
-                <span className="text-xs font-bold text-text-primary tabular-nums">{hoursDetail.summary?.sunHrs || 0}h <span className="text-text-muted font-normal">({hoursDetail.sundays.length}× × 9h)</span></span>
+                <span className="text-xs font-bold text-text-primary tabular-nums">{hoursDetail.summary?.sunHrs || 0}h <span className="text-text-muted font-normal">({hoursDetail.summary?.sunDays || 0}× × 9h)</span></span>
               </div>
               {hoursDetail.sundays.length > 0 ? (
                 <div className="space-y-0.5">
                   {hoursDetail.sundays.map((w, i) => (
                     <div key={i} className="flex items-center justify-between py-1 px-2.5 rounded hover:bg-surface-raised/50 text-xs">
-                      <span className="text-text-secondary">{format(new Date(w.from + 'T00:00:00'), 'dd/MM/yyyy')} – {format(new Date(w.to + 'T00:00:00'), 'dd/MM/yyyy')}</span>
-                      <span className="text-amber-400 font-medium tabular-nums">9h</span>
+                      <span className="text-text-secondary">
+                        {format(new Date(w.date + 'T00:00:00'), 'dd/MM/yyyy')}
+                        {!w.worked && <span className="text-amber-400/80 ml-1.5">holiday — not counted</span>}
+                      </span>
+                      <span className={w.worked ? 'text-amber-400 font-medium tabular-nums' : 'text-text-muted font-medium tabular-nums'}>{w.worked ? '9h' : '0h'}</span>
                     </div>
                   ))}
                 </div>
@@ -1320,7 +1526,11 @@ export default function ShiftPage() {
                         <span className="text-text-muted ml-1.5">{s.hours > 0 ? `covered for ${toProperCase(s.otherName)}` : `${toProperCase(s.otherName)} covered`}</span>
                         <span className="text-text-muted ml-1">({s.reason})</span>
                       </span>
-                      <span className={`font-medium tabular-nums ${s.hours > 0 ? 'text-green-400' : 'text-orange-400'}`}>{s.hours > 0 ? '+' : ''}{s.hours}h</span>
+                      {s.skipped ? (
+                        <span className="text-text-muted font-medium tabular-nums">0h <span className="font-normal">(holiday)</span></span>
+                      ) : (
+                        <span className={`font-medium tabular-nums ${s.hours > 0 ? 'text-green-400' : 'text-orange-400'}`}>{s.hours > 0 ? '+' : ''}{s.hours}h</span>
+                      )}
                     </div>
                   ))}
                 </div>
@@ -1333,6 +1543,11 @@ export default function ShiftPage() {
                 <span className="text-xs font-semibold text-red-400 uppercase tracking-wider">Replacement Leave Used</span>
                 <span className="text-xs font-bold text-text-primary tabular-nums">−{hoursDetail.summary?.usedHrs || 0}h <span className="text-text-muted font-normal">({hoursDetail.summary?.rlDays || 0} day{(hoursDetail.summary?.rlDays || 0) !== 1 ? 's' : ''})</span></span>
               </div>
+              {hoursDetail.rlEntries.some(l => l.source === 'calendar') && (
+                <p className="text-[11px] text-text-muted px-2.5 mb-1">
+                  Includes leave applied from Calendar → Mark Leave.
+                </p>
+              )}
               {hoursDetail.rlEntries.length > 0 ? (
                 <div className="space-y-0.5">
                   {hoursDetail.rlEntries.map((l, i) => (
@@ -1340,6 +1555,8 @@ export default function ShiftPage() {
                       <span className="text-text-secondary">
                         {format(new Date(l.leave_date + 'T00:00:00'), 'dd/MM/yyyy')}
                         <span className="text-text-muted ml-1.5">{l.duration === 0.5 ? 'Half day' : 'Full day'}</span>
+                        {l.onHoliday && <span className="text-amber-400/80 ml-1.5">holiday</span>}
+                        {l.source === 'calendar' && <span className="text-teal-400/80 ml-1.5">calendar</span>}
                       </span>
                       <span className="text-red-400 font-medium tabular-nums">−{l.duration * RL_DAY_HRS}h</span>
                     </div>
