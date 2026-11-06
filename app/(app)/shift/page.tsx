@@ -49,11 +49,19 @@ const RL_HOLIDAY_SCOPES = ['federal', 'SEL']
 // through the calendar (staff app / admin entry): 'Replacement', 'RL', 'Cuti Ganti'.
 const RL_REASON_RE = /replacement|cuti\s*ganti|\brl\b/i
 
-// Weekday standby = 2h/day (Mon–Fri), Sunday standby = 9am–6pm = 9h,
-// 1 day of replacement leave = 8h deduction (half day = 4h).
+// Weekday standby = 2h/day (Mon–Fri), weekend standby = Saturday 1pm–5.30pm
+// (4.5h) + Sunday 8.5h, 1 day of replacement leave = 8h deduction (half day = 4h).
+// NOTE: the Saturday Schedule (9am–1pm = 4h) is a separate roster and is NOT
+// part of standby — it goes to the OT claim, never to replacement leave.
 const WEEKDAY_HRS = 2
-const SUN_HRS = 9
+const SAT_HRS = 4.5
+const SUN_HRS = 8.5
 const RL_DAY_HRS = 8
+
+// The team started using this system in ISO week 18 of 2026 (Mon 27 Apr 2026).
+// Hours only accrue from that week — earlier imported standby weeks are history,
+// not balance.
+const RL_ACCRUAL_FROM = '2026-04-27'
 
 // WHY: a public/state/replacement holiday inside a standby week is already a day
 // off, so it earns no standby hours. (Applied leave is still deducted in full —
@@ -73,12 +81,16 @@ function standbyWeekDays(s: StandbyShift, holidayDates: Set<string>) {
     if (holidayDates.has(key)) weekdayHolidays.push(key)
     else weekdayWorked.push(key)
   })
+  const saturday = days.find(d => getDay(d) === 6)
+  const saturdayDate = saturday ? format(saturday, 'yyyy-MM-dd') : format(addDays(new Date(s.week_start + 'T00:00:00'), 5), 'yyyy-MM-dd')
   const sunday = days.find(d => getDay(d) === 0)
   const sundayDate = sunday ? format(sunday, 'yyyy-MM-dd') : s.week_end
   return {
     weekdayWorked,
     weekdayHolidays,
     weekdayHrs: weekdayWorked.length * WEEKDAY_HRS,
+    saturdayDate,
+    saturdayWorked: !holidayDates.has(saturdayDate),
     sundayDate,
     sundayWorked: !holidayDates.has(sundayDate),
   }
@@ -271,8 +283,7 @@ export default function ShiftPage() {
     return map
   }, [standbyShifts])
 
-  // ── Hours summary (Weekday 2h/day, Sun 9am-6pm=9h) ──
-  // Saturday (9am-1pm=4h) is OT claim, not replacement leave
+  // ── Hours summary (Weekday 2h/day, Sat 4.5h, Sun 8.5h) ──
   // 1 day RL = 8h deduction, 0.5 day = 4h
   const rlHolidayDates = useMemo(() => {
     const set = new Set<string>()
@@ -338,15 +349,18 @@ export default function ShiftPage() {
       name: string
       weekdayDays: number
       weekdayHrs: number
+      satDays: number
+      satHrs: number
       sunDays: number
       sunHrs: number
       holidayWeekdays: string[]
+      holidaySaturdays: string[]
       holidaySundays: string[]
     }
     const map: Record<string, Row> = {}
     const ensure = (id: string, name: string) => {
       if (!map[id]) {
-        map[id] = { name, weekdayDays: 0, weekdayHrs: 0, sunDays: 0, sunHrs: 0, holidayWeekdays: [], holidaySundays: [] }
+        map[id] = { name, weekdayDays: 0, weekdayHrs: 0, satDays: 0, satHrs: 0, sunDays: 0, sunHrs: 0, holidayWeekdays: [], holidaySaturdays: [], holidaySundays: [] }
       }
       return map[id]
     }
@@ -356,6 +370,7 @@ export default function ShiftPage() {
 
     allStandby.forEach(s => {
       if (s.week_end > today) return
+      if (s.week_start < RL_ACCRUAL_FROM) return
       const w = standbyWeekDays(s, rlHolidayDates)
       ;(s.weekday_staff || []).forEach(r => {
         const row = ensure(r.id, r.name)
@@ -365,6 +380,12 @@ export default function ShiftPage() {
       })
       ;(s.weekend_staff || []).forEach(r => {
         const row = ensure(r.id, r.name)
+        if (w.saturdayWorked) {
+          row.satDays += 1
+          row.satHrs += SAT_HRS
+        } else {
+          addHolidays(row.holidaySaturdays, [w.saturdayDate])
+        }
         if (w.sundayWorked) {
           row.sunDays += 1
           row.sunHrs += SUN_HRS
@@ -379,6 +400,7 @@ export default function ShiftPage() {
     const swapAdj: Record<string, number> = {}
     overrides.forEach(o => {
       if (o.override_date > today) return
+      if (o.override_date < RL_ACCRUAL_FROM) return
       if (rlHolidayDates.has(o.override_date)) return
       swapAdj[o.original_staff_id] = (swapAdj[o.original_staff_id] || 0) - o.hours
       swapAdj[o.replacement_staff_id] = (swapAdj[o.replacement_staff_id] || 0) + o.hours
@@ -396,7 +418,7 @@ export default function ShiftPage() {
     return Object.entries(map)
       .map(([id, h]) => {
         const swapHrs = swapAdj[id] || 0
-        const earnedHrs = h.weekdayHrs + h.sunHrs + swapHrs
+        const earnedHrs = h.weekdayHrs + h.satHrs + h.sunHrs + swapHrs
         const rlDays = rlByStaff[id] || 0
         const usedHrs = rlDays * RL_DAY_HRS
         return {
@@ -404,12 +426,15 @@ export default function ShiftPage() {
           name: h.name,
           weekdayDays: h.weekdayDays,
           weekdayHrs: h.weekdayHrs,
+          satDays: h.satDays,
+          satHrs: h.satHrs,
           sunDays: h.sunDays,
           sunHrs: h.sunHrs,
           holidayWeekdays: h.holidayWeekdays,
+          holidaySaturdays: h.holidaySaturdays,
           holidaySundays: h.holidaySundays,
-          holidayExcludedDays: h.holidayWeekdays.length + h.holidaySundays.length,
-          holidayExcludedHrs: h.holidayWeekdays.length * WEEKDAY_HRS + h.holidaySundays.length * SUN_HRS,
+          holidayExcludedDays: h.holidayWeekdays.length + h.holidaySaturdays.length + h.holidaySundays.length,
+          holidayExcludedHrs: h.holidayWeekdays.length * WEEKDAY_HRS + h.holidaySaturdays.length * SAT_HRS + h.holidaySundays.length * SUN_HRS,
           swapHrs,
           earnedHrs,
           rlDays,
@@ -424,20 +449,24 @@ export default function ShiftPage() {
     if (!hoursDetailFor) return null
     const today = format(new Date(), 'yyyy-MM-dd')
     const weekdays: { from: string; to: string; days: number; hrs: number; holidays: string[] }[] = []
+    const saturdays: { date: string; worked: boolean }[] = []
     const sundays: { date: string; worked: boolean }[] = []
 
     allStandby.forEach(s => {
       if (s.week_end > today) return
+      if (s.week_start < RL_ACCRUAL_FROM) return
       const w = standbyWeekDays(s, rlHolidayDates)
       if ((s.weekday_staff || []).some(r => r.id === hoursDetailFor)) {
         weekdays.push({ from: s.week_start, to: s.week_end, days: w.weekdayWorked.length, hrs: w.weekdayHrs, holidays: w.weekdayHolidays })
       }
       if ((s.weekend_staff || []).some(r => r.id === hoursDetailFor)) {
+        saturdays.push({ date: w.saturdayDate, worked: w.saturdayWorked })
         sundays.push({ date: w.sundayDate, worked: w.sundayWorked })
       }
     })
 
     weekdays.sort((a, b) => a.from.localeCompare(b.from))
+    saturdays.sort((a, b) => a.date.localeCompare(b.date))
     sundays.sort((a, b) => a.date.localeCompare(b.date))
 
     const rlEntries = rlApplications
@@ -458,7 +487,7 @@ export default function ShiftPage() {
 
     const summary = hoursSummary.find(h => h.id === hoursDetailFor)
 
-    return { weekdays, sundays, rlEntries, swapEntries, summary }
+    return { weekdays, saturdays, sundays, rlEntries, swapEntries, summary }
   }, [hoursDetailFor, allStandby, rlApplications, overrides, hoursSummary, rlHolidayDates])
 
   // ── Modal helpers ──────────────────────────────────────────────────────
@@ -847,6 +876,10 @@ export default function ShiftPage() {
             <Button size="sm" onClick={openAddModal}>+ Add Saturday</Button>
           </div>
 
+          <p className="mb-2 text-[11px] text-text-muted">
+            Saturday duty here is 9.00am – 1.00pm (4h) and is claimed as OT — it is not standby, so it never adds to replacement leave.
+          </p>
+
           {saturdaysInMonth.length === 0 ? (
             <EmptyState
               icon={<svg className="size-8 text-text-muted" fill="none" stroke="currentColor" strokeWidth={1.2} viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M6.75 3v2.25M17.25 3v2.25M3 18.75V7.5a2.25 2.25 0 012.25-2.25h13.5A2.25 2.25 0 0121 7.5v11.25m-18 0A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75" /></svg>}
@@ -1063,7 +1096,11 @@ export default function ShiftPage() {
                       <span className="text-text-secondary font-medium tabular-nums">{h.weekdayDays} day{h.weekdayDays === 1 ? '' : 's'} = <span className="text-indigo-400">{h.weekdayHrs}h</span></span>
                     </div>
                     <div className="flex items-center justify-between">
-                      <span className="text-text-tertiary">Sunday <span className="text-text-muted">(9h each)</span></span>
+                      <span className="text-text-tertiary">Sat standby <span className="text-text-muted">(4.5h each)</span></span>
+                      <span className="text-text-secondary font-medium tabular-nums">{h.satDays}× = <span className="text-teal-400">{h.satHrs}h</span></span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className="text-text-tertiary">Sunday <span className="text-text-muted">(8.5h each)</span></span>
                       <span className="text-text-secondary font-medium tabular-nums">{h.sunDays}× = <span className="text-amber-400">{h.sunHrs}h</span></span>
                     </div>
                     {h.holidayExcludedDays > 0 && (
@@ -1071,7 +1108,7 @@ export default function ShiftPage() {
                         <span className="text-text-tertiary">Holiday <span className="text-text-muted">(excluded)</span></span>
                         <span
                           className="text-text-muted font-medium tabular-nums cursor-help"
-                          title={[...h.holidayWeekdays, ...h.holidaySundays]
+                          title={[...h.holidayWeekdays, ...h.holidaySaturdays, ...h.holidaySundays]
                             .map(d => `${format(new Date(d + 'T00:00:00'), 'dd/MM')} ${(holidayMap.get(d) || ['Holiday'])[0]}`)
                             .join('\n')}
                         >
@@ -1488,11 +1525,35 @@ export default function ShiftPage() {
               )}
             </div>
 
+            {/* Saturday standby (1pm-5.30pm, paid to weekend staff) */}
+            <div>
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-xs font-semibold text-teal-400 uppercase tracking-wider">Saturday Standby</span>
+                <span className="text-xs font-bold text-text-primary tabular-nums">{hoursDetail.summary?.satHrs || 0}h <span className="text-text-muted font-normal">({hoursDetail.summary?.satDays || 0}× × 4.5h)</span></span>
+              </div>
+              <p className="text-[11px] text-text-muted px-2.5 mb-1">1pm – 5.30pm, same weekend rotation as Sunday.</p>
+              {hoursDetail.saturdays.length > 0 ? (
+                <div className="space-y-0.5 max-h-40 overflow-y-auto">
+                  {hoursDetail.saturdays.map((w, i) => (
+                    <div key={i} className="flex items-center justify-between py-1 px-2.5 rounded hover:bg-surface-raised/50 text-xs">
+                      <span className="text-text-secondary">
+                        {format(new Date(w.date + 'T00:00:00'), 'dd/MM/yyyy')}
+                        {!w.worked && <span className="text-amber-400/80 ml-1.5">closed — {(holidayMap.get(w.date) || ['holiday'])[0]}</span>}
+                      </span>
+                      <span className={w.worked ? 'text-teal-400 font-medium tabular-nums' : 'text-text-muted font-medium tabular-nums'}>{w.worked ? '4.5h' : '0h'}</span>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="text-xs text-text-muted px-2.5">No Saturday standby</p>
+              )}
+            </div>
+
             {/* Sunday / Weekend Standby */}
             <div>
               <div className="flex items-center justify-between mb-2">
                 <span className="text-xs font-semibold text-amber-400 uppercase tracking-wider">Sunday Standby</span>
-                <span className="text-xs font-bold text-text-primary tabular-nums">{hoursDetail.summary?.sunHrs || 0}h <span className="text-text-muted font-normal">({hoursDetail.summary?.sunDays || 0}× × 9h)</span></span>
+                <span className="text-xs font-bold text-text-primary tabular-nums">{hoursDetail.summary?.sunHrs || 0}h <span className="text-text-muted font-normal">({hoursDetail.summary?.sunDays || 0}× × 8.5h)</span></span>
               </div>
               {hoursDetail.sundays.length > 0 ? (
                 <div className="space-y-0.5">
@@ -1502,7 +1563,7 @@ export default function ShiftPage() {
                         {format(new Date(w.date + 'T00:00:00'), 'dd/MM/yyyy')}
                         {!w.worked && <span className="text-amber-400/80 ml-1.5">holiday — not counted</span>}
                       </span>
-                      <span className={w.worked ? 'text-amber-400 font-medium tabular-nums' : 'text-text-muted font-medium tabular-nums'}>{w.worked ? '9h' : '0h'}</span>
+                      <span className={w.worked ? 'text-amber-400 font-medium tabular-nums' : 'text-text-muted font-medium tabular-nums'}>{w.worked ? '8.5h' : '0h'}</span>
                     </div>
                   ))}
                 </div>
