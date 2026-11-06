@@ -290,6 +290,15 @@ export default function ShiftPage() {
     return set
   }, [holidays])
 
+  // WHY: `hoursSummary` creates a row for anyone found in the standby rosters or
+  // in a leave row — which would keep a resigned staff member on the Replacement
+  // Leave tab forever, because their historic standby weeks stay in the table.
+  // The tab is a balance board for the current team, so it only lists the staff
+  // this page already treats as current (profiles.is_active = true and role
+  // support/administrator, i.e. `agents`). Their standby history is untouched —
+  // it is still visible on the Standby Schedule tab.
+  const activeStaffIds = useMemo(() => new Set(agents.map(a => a.id)), [agents])
+
   // Every applied replacement-leave day, from both entry points. A staff member
   // who applied leave is always listed, even before any standby week completes.
   const rlApplications = useMemo<RlEntry[]>(() => {
@@ -326,7 +335,7 @@ export default function ShiftPage() {
   }, [leaves, staffLeaveRows, agents])
 
   const filteredApplications = useMemo(() => {
-    let list = rlApplications
+    let list = rlApplications.filter(l => activeStaffIds.has(l.staff_id))
     if (leaveFilterStaff !== 'all') {
       list = list.filter(l => l.staff_id === leaveFilterStaff)
     }
@@ -334,13 +343,13 @@ export default function ShiftPage() {
       list = list.filter(l => l.leave_date.startsWith(leaveFilterMonth))
     }
     return list
-  }, [rlApplications, leaveFilterStaff, leaveFilterMonth])
+  }, [rlApplications, activeStaffIds, leaveFilterStaff, leaveFilterMonth])
 
   const leaveMonthOptions = useMemo(() => {
     const months = new Set<string>()
-    rlApplications.forEach(l => months.add(l.leave_date.slice(0, 7)))
+    rlApplications.forEach(l => { if (activeStaffIds.has(l.staff_id)) months.add(l.leave_date.slice(0, 7)) })
     return Array.from(months).sort().reverse()
-  }, [rlApplications])
+  }, [rlApplications, activeStaffIds])
 
   const hoursSummary = useMemo(() => {
     const today = format(new Date(), 'yyyy-MM-dd')
@@ -415,6 +424,7 @@ export default function ShiftPage() {
     })
 
     return Object.entries(map)
+      .filter(([id]) => activeStaffIds.has(id))
       .map(([id, h]) => {
         const swapHrs = swapAdj[id] || 0
         const earnedHrs = h.weekdayHrs + h.satHrs + h.sunHrs + swapHrs
@@ -442,7 +452,7 @@ export default function ShiftPage() {
         }
       })
       .sort((a, b) => b.balanceHrs - a.balanceHrs)
-  }, [allStandby, rlApplications, overrides, rlHolidayDates])
+  }, [allStandby, rlApplications, overrides, rlHolidayDates, activeStaffIds])
 
   const hoursDetail = useMemo(() => {
     if (!hoursDetailFor) return null
