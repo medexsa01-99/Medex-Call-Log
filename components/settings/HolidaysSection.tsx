@@ -158,7 +158,7 @@ export default function HolidaysSection() {
       {!collapsed && (
       <>
       <p className="text-xs text-text-tertiary mt-3 mb-4">
-        Federal holidays apply nationwide. State holidays warn only when scheduling for a clinic in that state.
+        Every holiday listed here closes the day for standby on the Shift page, whatever its scope. Federal holidays apply nationwide. State holidays warn only when scheduling for a clinic in that state.
       </p>
 
       {/* Add row */}

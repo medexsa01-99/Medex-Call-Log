@@ -38,12 +38,10 @@ type RlEntry = {
   source: 'shift' | 'calendar'
 }
 
-const HOLIDAY_SCOPES = ['federal', 'SEL', 'KUL']
-
-// Holidays that earn no standby hours: Malaysian federal holidays + Selangor
-// state holidays (incl. the replacement holidays admin records for a holiday
-// that falls on a weekend).
-const RL_HOLIDAY_SCOPES = ['federal', 'SEL']
+// Every public_holidays row is a closed day for the standby team, whatever its
+// scope: holidays are entered through Schedule → + Holiday (and Settings), and
+// the office is shut whenever the team records one — a company off-day entered
+// with a non-federal scope must still stop standby hours.
 
 // Replacement-leave applications can be typed in a few ways once they arrive
 // through the calendar (staff app / admin entry): 'Replacement', 'RL', 'Cuti Ganti'.
@@ -206,7 +204,7 @@ export default function ShiftPage() {
       const [profileRes, agentsRes, holidaysRes, logsRes, allStandbyRes, overridesRes] = await Promise.all([
         supabase.from('profiles').select('display_name, role').eq('id', uid).single(),
         supabase.from('profiles').select('id, display_name').eq('is_active', true).in('role', ['support', 'administrator']).order('display_name'),
-        supabase.from('public_holidays').select('*').in('scope', HOLIDAY_SCOPES),
+        supabase.from('public_holidays').select('*'),
         supabase.from('shift_logs').select('*').order('created_at', { ascending: false }).limit(20),
         supabase.from('standby_shifts').select('*'),
         supabase.from('standby_overrides').select('*').order('override_date'),
@@ -285,9 +283,10 @@ export default function ShiftPage() {
 
   // ── Hours summary (Weekday 2h/day, Sat 4.5h, Sun 8.5h) ──
   // 1 day RL = 8h deduction, 0.5 day = 4h
+  // Every recorded holiday closes the office, so any scope counts here.
   const rlHolidayDates = useMemo(() => {
     const set = new Set<string>()
-    holidays.forEach(h => { if (RL_HOLIDAY_SCOPES.includes(h.scope)) set.add(h.holiday_date) })
+    holidays.forEach(h => set.add(h.holiday_date))
     return set
   }, [holidays])
 

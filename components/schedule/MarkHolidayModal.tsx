@@ -114,7 +114,8 @@ export default function MarkHolidayModal({ open, onClose, onSaved, prefilledDate
             {SCOPE_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
           </select>
           <p className="text-[11px] text-text-tertiary mt-1">
-            Federal shows on every calendar. State holidays show on the calendar only if Selangor or Kuala Lumpur; otherwise they only warn when scheduling for a clinic in that state.
+            Any holiday added here closes the day for standby on the Shift page (no standby hours earned), whatever scope you pick.
+            Federal shows on every calendar; state holidays show on the calendar only if Selangor or Kuala Lumpur, otherwise they only warn when scheduling for a clinic in that state.
           </p>
         </div>
 
